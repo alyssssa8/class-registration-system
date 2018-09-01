@@ -1,0 +1,249 @@
+#include <gecode/int.hh>
+#include <gecode/minimodel.hh>
+#include <gecode/search.hh>
+#include <gecode/gist.hh>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <regex>
+#include <iomanip>
+
+using namespace Gecode;
+
+#define MAX_TIME 18
+#define MIN_TIME 8
+#define TIME_STEP 2
+#define TIME_SLOTS_PER_ROOM ((MAX_TIME - MIN_TIME) / TIME_STEP + 1)
+#define INSTRUCTOR_SECTIONS 3
+#define MAX_VALUE 100000
+
+class Course {
+public:
+    std::string department;
+    std::string name;
+    int section;
+};
+
+class Instructor {
+public:
+    std::string name;
+    std::string department;
+    std::vector<Course> perferred_courses;
+};
+
+class CourseScheduler : public Space {
+protected:
+    IntVarArray v_time_start_;
+    IntVarArray v_time_end_;
+    IntVarArray v_instructor_;
+    IntVarArray v_room_;
+   
+    std::vector<Course> *course_list_;
+    std::vector<Instructor> *instructor_list_;
+    std::vector<std::string> *room_list_;
+
+public:
+    CourseScheduler(std::vector<Course> *course_list, std::vector<Instructor> *instructor_list, std::vector<std::string> *room_list) {
+        course_list_ = course_list;
+        instructor_list_ = instructor_list;
+        room_list_ = room_list;
+
+        int task_size = course_list_->size();
+        v_time_start_ = IntVarArray(*this, task_size, MIN_TIME, MAX_TIME);
+        v_time_end_ = IntVarArray(*this, task_size, MIN_TIME + TIME_STEP, MAX_TIME + TIME_STEP);
+        v_instructor_ = IntVarArray(*this, task_size, 0, instructor_list_->size() - 1);
+        v_room_ = IntVarArray(*this, task_size, 0, room_list_->size() - 1);
+
+        IntArgs time_length = IntArgs::create(task_size, TIME_STEP, 0);
+        IntArgs resource_room = IntArgs::create(task_size, 1, 0);
+        IntArgs resource_used = IntArgs::create(task_size, 1, 0);
+
+        // limit the room number to less than or equal to the time slots available
+        for (int i = 0; i < room_list_->size(); i++) {
+            count(*this, v_room_, i, IRT_LQ, TIME_SLOTS_PER_ROOM);
+        }
+
+        // limit time_start must be less than time_end by 2
+        for (int i = 0; i < task_size; i++) {
+            rel(*this, v_time_start_[i] + time_length[i] == v_time_end_[i]);
+        }
+
+        // instructors can only be assigned courses from one department
+        for (int i = 0; i < task_size; i++) {
+            IntArgs instructors;
+            std::string department = (*course_list_)[i].department;
+            for (int ins_index = 0; ins_index < instructor_list_->size(); ins_index++) {
+                if ((*instructor_list_)[ins_index].department == department) {
+                    instructors << ins_index;
+                }
+            }
+            IntSet set(instructors);
+            dom(*this, v_instructor_[i], set);
+        }
+
+        // each instructor has same section limit
+        for (int i = 0; i < instructor_list_->size(); i++) {
+            count(*this, v_instructor_, i, IRT_LQ, INSTRUCTOR_SECTIONS);
+        }
+
+        // each instructor can only teach one section at a time
+        // make time * 100 + instructor to be unique
+        IntVarArray multi_and_add(*this, task_size, 0, MAX_VALUE);
+        for (int i = 0; i < task_size; i++) {
+            rel(*this, v_instructor_[i] + v_time_start_[i] * 100 == multi_and_add[i]);
+        }
+        distinct(*this, multi_and_add);
+
+        // all of the instructors must teach at least one course
+        nvalues(*this, v_instructor_, IRT_EQ, instructor_list_->size());
+
+        // scheduling
+        cumulatives(*this, v_room_, v_time_start_, time_length, v_time_end_, resource_used, resource_room, true);
+
+        // customized branch function
+        // will first branch the instructor with preferred courses
+        auto branch_preferred = [this](const Space& home, IntVar x, int i) {
+            const CourseScheduler& b = static_cast<const CourseScheduler&>(home);
+            IntVarValues values(x);
+            int val = -1;
+            // find if there is any instructor prefer this courses
+            while (values()) {
+                Course course = (*course_list_)[i];
+                val = values.val();
+                for (auto preferred = (*instructor_list_)[val].perferred_courses.begin(); preferred != (*instructor_list_)[val].perferred_courses.end(); preferred++) {
+                    if ((preferred->department == course.department) && (preferred->name == course.name)) {
+                        return val;
+                    }
+                }
+                ++values;
+            }
+            // if nobody prefer, find the instructor whose preferred courses have been assigned
+            values = x;
+            while (values()) {
+                Course course = (*course_list_)[i];
+                val = values.val();
+                bool found = true;
+                for (auto preferred = (*instructor_list_)[val].perferred_courses.begin(); preferred != (*instructor_list_)[val].perferred_courses.end(); preferred++) {
+                    if ((preferred->department == course.department) && (preferred->name > course.name)) {
+                        found = false;
+                    }
+                }
+                if (found == true) {
+                    return val;
+                }
+                ++values;
+            }
+
+            // default
+            return x.min();
+        };
+              
+        // branching
+        branch(*this, v_room_, INT_VAR_SIZE_MIN(), INT_VAL_MIN());
+        branch(*this, v_time_start_, INT_VAR_SIZE_MIN(), INT_VAL_MIN());
+        branch(*this, v_time_end_, INT_VAR_SIZE_MIN(), INT_VAL_MIN());
+        branch(*this, v_instructor_, INT_VAR_SIZE_MIN(), INT_VAL(branch_preferred));
+    }
+
+    CourseScheduler(bool share, CourseScheduler& s) : Space(share, s) {
+        v_time_start_.update(*this, share, s.v_time_start_);
+        v_time_end_.update(*this, share, s.v_time_end_);
+        v_instructor_.update(*this, share, s.v_instructor_);
+        v_room_.update(*this, share, s.v_room_);
+
+        course_list_ = s.course_list_;
+        instructor_list_ = s.instructor_list_;
+        room_list_ = s.room_list_;
+    }
+
+    virtual Space* copy(bool share) {
+        return new CourseScheduler(share, *this);
+    }
+
+    void print(void) const {
+        int task_size = course_list_->size();
+        for (unsigned int i = 0; i < task_size; i++) {
+            std::cout << std::left
+                << "Course: " << (*course_list_)[i].department << (*course_list_)[i].name << " Section: " << std::setw(3) << (*course_list_)[i].section
+                << "Instructor: " << std::setw(20) << (*instructor_list_)[v_instructor_[i].val()].name
+                << "Time: " << std::setw(6) << std::to_string(v_time_start_[i].val()) + ":00" << "to " << std::setw(7) << std::to_string(v_time_end_[i].val()) + ":00"
+                << "Room: " << (*room_list_)[v_room_[i].val()] << std::endl;
+        }
+    }
+
+};
+
+int LoadData(std::vector<Course> &course_list, std::vector<Instructor> &instructor_list, std::vector<std::string> &room_list)
+{
+    std::ifstream input;
+    std::string line;
+
+    std::regex re_instructor("Instructor:\\s+(\\w+)\\s+(\\w+)\\s+(\\w\\w)");
+    std::regex re_instructor_prefer("(\\d\\d\\d\\d)");
+    std::regex re_course("Course:\\s+(\\w\\w)(\\w+)\\s+(\\d+)");
+    std::regex re_room("Room:\\s+(\\w+.*)");
+
+    std::smatch match;
+
+    input.open("data.txt");
+
+    while (std::getline(input, line)) {
+
+        if (std::regex_search(line, match, re_instructor)) {
+            Instructor instructor;
+            instructor.name = match[1].str() + " " + match[2].str();
+            instructor.department = match[3].str();
+            while (std::regex_search(line, match, re_instructor_prefer)) {
+                Course course;
+                course.department = instructor.department;
+                course.name = match[1].str();
+                course.section = 0;
+                instructor.perferred_courses.push_back(course);
+                line = match.suffix();
+            }
+            instructor_list.push_back(instructor);
+        } else if (std::regex_search(line, match, re_course)) {
+            Course course;
+            course.department = match[1].str();
+            course.name = match[2].str();
+            for (int i = 0; i < std::atoi(match[3].str().c_str()); i++) {
+                course.section = i + 1;
+                course_list.push_back(course);
+            }
+        } else if (std::regex_search(line, match, re_room)) {
+            room_list.push_back(match[1].str());
+        } else {
+        }
+
+    }
+
+    input.close();
+    return 0;
+}
+
+
+int main(int argc, char* argv[]) {
+
+    std::vector<Instructor> instructor_list;
+    std::vector<Course> course_list;
+    std::vector<std::string> room_list;
+
+    LoadData(course_list, instructor_list, room_list);
+    CourseScheduler *scheduler = new CourseScheduler(&course_list, &instructor_list, &room_list);
+
+    DFS<CourseScheduler> e(scheduler);
+    delete scheduler;
+    // search and print all solutions
+    try {
+        while (CourseScheduler* s = e.next()) {
+            s->print();
+            delete s;
+            break;
+        }
+    } catch (Exception e) {
+        std::cout << e.what() << std::endl;
+    }
+
+    return 0;
+}
